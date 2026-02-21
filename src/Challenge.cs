@@ -1,19 +1,12 @@
-// DESAFIO: Sistema de Acesso a Documentos Confidenciais
-// PROBLEMA: Uma aplicação corporativa precisa controlar acesso a documentos sensíveis,
-// fazer cache de documentos pesados e registrar todas as operações. O código atual
-// mistura lógica de negócio com controle de acesso, cache e logging
-
 using System;
 using System.Collections.Generic;
 using System.Threading;
 
 namespace DesignPatternChallenge
 {
-    // Contexto: Sistema que gerencia documentos confidenciais com requisitos de:
-    // - Controle de acesso baseado em permissões
-    // - Cache para documentos pesados
-    // - Auditoria de todas as operações
-    
+    // ============================
+    // 1) MODELOS
+    // ============================
     public class ConfidentialDocument
     {
         public string Id { get; set; }
@@ -28,20 +21,43 @@ namespace DesignPatternChallenge
             Title = title;
             Content = content;
             SecurityLevel = securityLevel;
-            SizeInBytes = content.Length * 2; // Simulando tamanho
+            SizeInBytes = content.Length * 2;
         }
     }
 
-    // Classe real que acessa documentos (recurso custoso)
-    public class DocumentRepository
+    public class User
+    {
+        public string Username { get; set; }
+        public int ClearanceLevel { get; set; }
+
+        public User(string username, int clearanceLevel)
+        {
+            Username = username;
+            ClearanceLevel = clearanceLevel;
+        }
+    }
+
+    // ============================
+    // 2) SUBJECT (contrato comum)
+    // ============================
+    public interface IDocumentRepository
+    {
+        ConfidentialDocument GetDocument(string documentId);
+        void UpdateDocument(string documentId, string newContent);
+    }
+
+    // ============================
+    // 3) REAL SUBJECT (recurso custoso)
+    // ============================
+    public class DocumentRepository : IDocumentRepository
     {
         private Dictionary<string, ConfidentialDocument> _database;
 
         public DocumentRepository()
         {
             Console.WriteLine("[Repository] Inicializando conexão com banco de dados...");
-            Thread.Sleep(1000); // Simulando conexão pesada
-            
+            Thread.Sleep(1000);
+
             _database = new Dictionary<string, ConfidentialDocument>
             {
                 ["DOC001"] = new ConfidentialDocument(
@@ -68,15 +84,14 @@ namespace DesignPatternChallenge
         public ConfidentialDocument GetDocument(string documentId)
         {
             Console.WriteLine($"[Repository] Carregando documento {documentId} do banco...");
-            Thread.Sleep(500); // Simulando operação custosa
-            
+            Thread.Sleep(500);
+
             if (_database.ContainsKey(documentId))
             {
                 var doc = _database[documentId];
                 Console.WriteLine($"[Repository] Documento carregado: {doc.SizeInBytes / (1024 * 1024)} MB");
                 return doc;
             }
-            
             return null;
         }
 
@@ -84,7 +99,7 @@ namespace DesignPatternChallenge
         {
             Console.WriteLine($"[Repository] Atualizando documento {documentId}...");
             Thread.Sleep(300);
-            
+
             if (_database.ContainsKey(documentId))
             {
                 _database[documentId].Content = newContent;
@@ -92,152 +107,155 @@ namespace DesignPatternChallenge
         }
     }
 
-    public class User
+    // ============================
+    // 4) PROXY (segurança + cache + auditoria + lazy)
+    // ============================
+    public class DocumentRepositoryProxy
     {
-        public string Username { get; set; }
-        public int ClearanceLevel { get; set; }
+        private IDocumentRepository _realRepository; // lazy
+        private readonly Dictionary<string, ConfidentialDocument> _cache = new();
+        private readonly List<string> _auditLog = new();
 
-        public User(string username, int clearanceLevel)
+        private IDocumentRepository Real
         {
-            Username = username;
-            ClearanceLevel = clearanceLevel;
-        }
-    }
-
-    // Problema: Cliente precisa implementar controle de acesso, cache e logging
-    public class DocumentService
-    {
-        private DocumentRepository _repository;
-        private Dictionary<string, ConfidentialDocument> _cache;
-        private List<string> _auditLog;
-
-        public DocumentService()
-        {
-            _repository = new DocumentRepository(); // Conexão custosa sempre criada
-            _cache = new Dictionary<string, ConfidentialDocument>();
-            _auditLog = new List<string>();
+            get
+            {
+                if (_realRepository == null)
+                    _realRepository = new DocumentRepository(); // criado só quando necessário
+                return _realRepository;
+            }
         }
 
         public ConfidentialDocument ViewDocument(string documentId, User user)
         {
-            // Problema 1: Lógica de auditoria misturada
-            var logEntry = $"[{DateTime.Now:HH:mm:ss}] {user.Username} tentou acessar {documentId}";
-            _auditLog.Add(logEntry);
-            Console.WriteLine($"[Audit] {logEntry}");
+            Audit($"{user.Username} tentou VISUALIZAR {documentId}");
 
-            // Problema 2: Verificação de acesso manual
-            ConfidentialDocument doc;
-            
-            if (_cache.ContainsKey(documentId))
+            // Cache primeiro
+            if (_cache.TryGetValue(documentId, out var cached))
             {
                 Console.WriteLine($"[Cache] Documento {documentId} encontrado no cache");
-                doc = _cache[documentId];
+                return AuthorizeAndReturn(cached, user);
             }
-            else
-            {
-                doc = _repository.GetDocument(documentId);
-                if (doc != null)
-                {
-                    _cache[documentId] = doc; // Cache manual
-                }
-            }
+
+            // Lazy load: cria repo e busca quando precisa
+            var doc = Real.GetDocument(documentId);
 
             if (doc == null)
             {
                 Console.WriteLine($"❌ Documento {documentId} não encontrado");
+                Audit($"DOCUMENTO NÃO ENCONTRADO {documentId}");
                 return null;
             }
 
-            // Problema 3: Controle de acesso espalhado no código
-            if (user.ClearanceLevel < doc.SecurityLevel)
-            {
-                Console.WriteLine($"❌ Acesso negado! Nível {user.ClearanceLevel} < Requerido {doc.SecurityLevel}");
-                _auditLog.Add($"[{DateTime.Now:HH:mm:ss}] ACESSO NEGADO para {user.Username}");
-                return null;
-            }
+            // guarda no cache
+            _cache[documentId] = doc;
 
-            Console.WriteLine($"✅ Acesso permitido ao documento: {doc.Title}");
-            return doc;
+            return AuthorizeAndReturn(doc, user);
         }
 
-        public void EditDocument(string documentId, User user, string newContent)
+        public bool EditDocument(string documentId, User user, string newContent)
         {
-            // Problema: Mesmo código de controle e auditoria repetido
-            var logEntry = $"[{DateTime.Now:HH:mm:ss}] {user.Username} tentou editar {documentId}";
-            _auditLog.Add(logEntry);
-            Console.WriteLine($"[Audit] {logEntry}");
+            Audit($"{user.Username} tentou EDITAR {documentId}");
 
-            var doc = _cache.ContainsKey(documentId) 
-                ? _cache[documentId] 
-                : _repository.GetDocument(documentId);
+            // Busca (cache ou repo)
+            var doc = _cache.TryGetValue(documentId, out var cached)
+                ? cached
+                : Real.GetDocument(documentId);
 
-            if (doc == null || user.ClearanceLevel < doc.SecurityLevel)
+            if (doc == null)
             {
-                Console.WriteLine($"❌ Operação não autorizada");
-                return;
+                Console.WriteLine("❌ Documento não encontrado");
+                Audit($"EDIT NEGADO - DOC NÃO ENCONTRADO {documentId}");
+                return false;
             }
 
-            _repository.UpdateDocument(documentId, newContent);
-            
-            // Problema: Invalidar cache manualmente
+            if (!HasAccess(user, doc))
+            {
+                Console.WriteLine($"❌ Operação não autorizada (nível {user.ClearanceLevel} < {doc.SecurityLevel})");
+                Audit($"EDIT NEGADO para {user.Username} em {documentId}");
+                return false;
+            }
+
+            Real.UpdateDocument(documentId, newContent);
+
+            // invalida cache do documento atualizado
             if (_cache.ContainsKey(documentId))
-            {
                 _cache.Remove(documentId);
-            }
 
-            Console.WriteLine($"✅ Documento atualizado");
+            Console.WriteLine("✅ Documento atualizado");
+            Audit($"EDIT OK por {user.Username} em {documentId}");
+            return true;
         }
 
         public void ShowAuditLog()
         {
             Console.WriteLine("\n=== Log de Auditoria ===");
             foreach (var entry in _auditLog)
-            {
                 Console.WriteLine(entry);
+        }
+
+        private ConfidentialDocument AuthorizeAndReturn(ConfidentialDocument doc, User user)
+        {
+            if (!HasAccess(user, doc))
+            {
+                Console.WriteLine($"❌ Acesso negado! Nível {user.ClearanceLevel} < Requerido {doc.SecurityLevel}");
+                Audit($"ACESSO NEGADO para {user.Username} em {doc.Id}");
+                return null;
             }
+
+            Console.WriteLine($"✅ Acesso permitido ao documento: {doc.Title}");
+            Audit($"ACESSO OK para {user.Username} em {doc.Id}");
+            return doc;
+        }
+
+        private static bool HasAccess(User user, ConfidentialDocument doc)
+            => user.ClearanceLevel >= doc.SecurityLevel;
+
+        private void Audit(string message)
+        {
+            var entry = $"[{DateTime.Now:HH:mm:ss}] {message}";
+            _auditLog.Add(entry);
+            Console.WriteLine($"[Audit] {entry}");
         }
     }
 
+    // ============================
+    // 5) DEMO
+    // ============================
     class Program
     {
         static void Main(string[] args)
         {
-            Console.WriteLine("=== Sistema de Documentos Confidenciais ===\n");
+            Console.WriteLine("=== Sistema de Documentos Confidenciais (Proxy) ===\n");
 
-            // Problema: Inicialização custosa mesmo se não usar
-            var service = new DocumentService();
+            // Agora não cria repo imediatamente (lazy)
+            var proxy = new DocumentRepositoryProxy();
 
             var manager = new User("joao.silva", 5);
             var employee = new User("maria.santos", 2);
 
             Console.WriteLine("\n--- Gerente acessando documento de alto nível ---");
-            var doc1 = service.ViewDocument("DOC002", manager);
+            proxy.ViewDocument("DOC002", manager);
 
             Console.WriteLine("\n--- Funcionário tentando acessar mesmo documento ---");
-            var doc2 = service.ViewDocument("DOC002", employee);
+            proxy.ViewDocument("DOC002", employee);
 
-            Console.WriteLine("\n--- Gerente acessando novamente (deveria usar cache) ---");
-            var doc3 = service.ViewDocument("DOC002", manager);
+            Console.WriteLine("\n--- Gerente acessando novamente (cache) ---");
+            proxy.ViewDocument("DOC002", manager);
 
             Console.WriteLine("\n--- Funcionário acessando documento permitido ---");
-            var doc4 = service.ViewDocument("DOC003", employee);
+            proxy.ViewDocument("DOC003", employee);
 
-            service.ShowAuditLog();
+            Console.WriteLine("\n--- Gerente editando documento ---");
+            proxy.EditDocument("DOC003", manager, "Novo conteúdo atualizado...");
 
-            Console.WriteLine("\n=== PROBLEMAS ===");
-            Console.WriteLine("✗ Lógica de controle de acesso misturada com lógica de negócio");
-            Console.WriteLine("✗ Cache implementado manualmente em cada operação");
-            Console.WriteLine("✗ Auditoria espalhada por todo o código");
-            Console.WriteLine("✗ Repository sempre criado, mesmo se não usado (lazy loading impossível)");
-            Console.WriteLine("✗ Difícil adicionar nova funcionalidade (ex: rate limiting)");
-            Console.WriteLine("✗ Código duplicado entre ViewDocument e EditDocument");
-            Console.WriteLine("✗ Cliente conhece muito sobre implementação interna");
+            proxy.ShowAuditLog();
 
-            // Perguntas para reflexão:
-            // - Como adicionar funcionalidade sem modificar a classe original?
-            // - Como controlar acesso ao objeto real de forma transparente?
-            // - Como implementar lazy loading (criação sob demanda)?
-            // - Como adicionar cache, logging e segurança de forma desacoplada?
+            Console.WriteLine("\n✅ Proxy resolveu:");
+            Console.WriteLine("• Controle de acesso centralizado");
+            Console.WriteLine("• Cache automático");
+            Console.WriteLine("• Auditoria centralizada");
+            Console.WriteLine("• Lazy loading do repositório");
         }
     }
 }
